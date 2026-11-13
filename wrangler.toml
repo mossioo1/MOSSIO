@@ -1,0 +1,23 @@
+name = "mossio-classified"
+main = "worker/index.js"
+compatibility_date = "2026-11-13"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*", "/media/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mossio-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "mossio-media"
+
+[vars]
+APP_NAME = "MOSSIO"
+SESSION_TTL_DAYS = "7"
+MAX_UPLOAD_MB = "25"
