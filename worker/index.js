@@ -4,7 +4,7 @@ const json = (data, status=200, headers={}) => new Response(JSON.stringify(data)
 const secureHeaders = {
   'X-Content-Type-Options':'nosniff', 'X-Frame-Options':'DENY', 'Referrer-Policy':'strict-origin-when-cross-origin',
   'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
-  'Content-Security-Policy':"default-src 'self'; img-src 'self' data: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self'; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+  'Content-Security-Policy':"default-src 'self'; img-src 'self' data: https:; media-src 'self' https: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self'; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 };
 function withSecurity(response){ const h=new Headers(response.headers); for(const [k,v] of Object.entries(secureHeaders)) h.set(k,v); return new Response(response.body,{status:response.status,statusText:response.statusText,headers:h}); }
 const b64 = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
@@ -16,6 +16,15 @@ async function auth(request,env){ const token=cookieValue(request,COOKIE); if(!t
 function setCookie(token,days){ return `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${days*86400}`; }
 const clearCookie=()=>`${COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
 async function bodyJSON(req){ try{return await req.json()}catch{return null} }
+async function cloudinarySignature(params, secret) {
+  const data = Object.keys(params).sort()
+    .map(key => `${key}=${params[key]}`)
+    .join('&') + secret;
+  const digest = await crypto.subtle.digest('SHA-1', encoder.encode(data));
+  return Array.from(new Uint8Array(digest))
+    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 const allowedTypes=new Set(['projects','gallery','tools','skills','timeline','news','social']);
 async function handle(request,env){
  const url=new URL(request.url), path=url.pathname, method=request.method;
@@ -69,21 +78,34 @@ async function handle(request,env){
    }
    const del=path.match(/^\/api\/admin\/content\/([\w-]+)$/); if(del&&method==='DELETE'){await env.DB.prepare('DELETE FROM content WHERE id=?').bind(del[1]).run();return json({ok:true});}
    if(path==='/api/admin/upload'&&method==='POST'){
-     const form=await request.formData(), file=form.get('file'); if(!(file instanceof File)) return json({error:'Choose a file.'},400);
-     const max=Number(env.MAX_UPLOAD_MB||25)*1024*1024; if(file.size<1||file.size>max) return json({error:`File must be smaller than ${env.MAX_UPLOAD_MB||25} MB.`},413);
-     const mime=file.type.toLowerCase(); const allowed=/^(image\/(png|jpeg|webp|gif)|video\/(mp4|webm)|audio\/(mpeg|mp3|wav|ogg|mp4|aac))$/.test(mime);
+     const form=await request.formData(), file=form.get('file');
+     if(!(file instanceof File)) return json({error:'Choose a file.'},400);
+     const max=Number(env.MAX_UPLOAD_MB||25)*1024*1024;
+     if(file.size<1||file.size>max) return json({error:`File must be smaller than ${env.MAX_UPLOAD_MB||25} MB.`},413);
+     const mime=file.type.toLowerCase();
+     const allowed=/^(image\/(png|jpeg|webp|gif)|video\/(mp4|webm)|audio\/(mpeg|mp3|wav|ogg|mp4|aac))$/.test(mime);
      if(!allowed) return json({error:'Unsupported file type.'},415);
-     const ext=(file.name.split('.').pop()||'bin').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,8)||'bin';
-     const key=`uploads/${new Date().toISOString().slice(0,10)}/${crypto.randomUUID()}.${ext}`;
-     await env.MEDIA.put(key,await file.arrayBuffer(),{httpMetadata:{contentType:mime,cacheControl:'public, max-age=31536000, immutable'},customMetadata:{originalName:file.name.slice(0,120)}});
-     return json({ok:true,key,url:`/media/${key}`},201);
+     if(!env.CLOUDINARY_CLOUD_NAME||!env.CLOUDINARY_API_KEY||!env.CLOUDINARY_API_SECRET)
+       return json({error:'Cloudinary is not configured.'},503);
+
+     const timestamp=Math.floor(Date.now()/1000);
+     const params={folder:'mossio',timestamp};
+     const signature=await cloudinarySignature(params,env.CLOUDINARY_API_SECRET);
+     const uploadForm=new FormData();
+     uploadForm.set('file',file,file.name);
+     uploadForm.set('api_key',env.CLOUDINARY_API_KEY);
+     uploadForm.set('timestamp',String(timestamp));
+     uploadForm.set('folder','mossio');
+     uploadForm.set('signature',signature);
+
+     const endpoint=`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/auto/upload`;
+     const response=await fetch(endpoint,{method:'POST',body:uploadForm});
+     const result=await response.json().catch(()=>null);
+     if(!response.ok||!result?.secure_url)
+       return json({error:result?.error?.message||'Cloudinary upload failed.'},502);
+     return json({ok:true,key:result.public_id,url:result.secure_url},201);
    }
    return json({error:'Not found'},404);
- }
- if(path.startsWith('/media/')){
-   const key=decodeURIComponent(path.slice('/media/'.length)); if(key.includes('..')) return json({error:'Invalid key'},400);
-   const object=await env.MEDIA.get(key); if(!object) return json({error:'Not found'},404);
-   const h=new Headers(); object.writeHttpMetadata(h); h.set('etag',object.httpEtag); h.set('X-Content-Type-Options','nosniff'); return new Response(object.body,{headers:h});
  }
  return env.ASSETS.fetch(request);
 }
